@@ -1,0 +1,1 @@
+web: node index.js 2>&1 | cat

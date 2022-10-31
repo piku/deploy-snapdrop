@@ -1,6 +1,6 @@
 # Snapdrop 
 
-A fork of [Snapdrop](https://github.com/RobinLinus/snapdrop) for my own purposes.
+A fork of [Snapdrop](https://github.com/RobinLinus/snapdrop) for private use on a LAN.
 
 This changes a number of things about the original, since I wanted to use it solely inside my home LAN:
 

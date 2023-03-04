@@ -531,6 +531,11 @@ class Snapdrop {
         const server = new ServerConnection();
         const peers = new PeersManager(server);
         const peersUI = new PeersUI();
+        const btnRestart = document.getElementById('restart');
+        // Listen for a click on the button 
+        btnRestart.addEventListener('click', function() {
+            server.send({type: "restart"})
+        });
         Events.on('load', e => {
             const receiveDialog = new ReceiveDialog();
             const sendTextDialog = new SendTextDialog();

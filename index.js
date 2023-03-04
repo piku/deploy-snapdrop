@@ -73,6 +73,10 @@ class SnapdropServer {
         }
 
         switch (message.type) {
+            case 'restart':
+                console.info("Peer asked us to restart...")
+                process.exit(1);
+                break;
             case 'disconnect':
                 this._leaveRoom(sender);
                 break;

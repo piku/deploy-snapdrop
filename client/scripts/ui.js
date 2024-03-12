@@ -9,10 +9,19 @@ window.iOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
 Events.on('display-name', e => {
     const me = e.detail.message;
     const $displayName = $('displayName')
-    $displayName.textContent = 'You are known as ' + me.displayName;
+    $displayName.textContent = me.displayName
     $displayName.title = me.deviceName;
 });
+Events.on('edit-name-commit',e => {
+    const name = e.detail.text
+    const $displayName = $('displayName')
+    $displayName.textContent = name
+    Events.fire('peer-name',name)
+})
 
+$('editNameBt').addEventListener('click',e => {
+    Events.fire('edit-name')
+})
 class PeersUI {
 
     constructor() {
@@ -21,18 +30,31 @@ class PeersUI {
         Events.on('peers', e => this._onPeers(e.detail));
         Events.on('file-progress', e => this._onFileProgress(e.detail));
         Events.on('paste', e => this._onPaste(e));
+        Events.on('peer-modify-name', e => this._onPeerModifyName(e.detail));
+        Events.on('close-progress',e => this._closeProgress(e.detail));
+        Events.on('clear-cancel',e => this._clearCancel(e.detail))
     }
 
-    _onPeerJoined(peer) {
+    _onPeerJoined(peer, currentPeerInfo) {
+        if(JSON.stringify(peer.name) == JSON.stringify(currentPeerInfo)){
+            Events.fire('notify-user', jQuery.i18n.prop('same_notice'));
+        }
         if ($(peer.id)) return; // peer already exists
         const peerUI = new PeerUI(peer);
         $$('x-peers').appendChild(peerUI.$el);
         setTimeout(e => window.animateBackground(false), 1750); // Stop animation
     }
 
-    _onPeers(peers) {
+    _onPeerModifyName(peer) {
+        let el = $(peer.id)      
+        el.querySelector('.name').textContent = peer.name.displayName;
+    }
+
+    _onPeers(msg) {
+        const currentPeerInfo = msg.currentPeerInfo
+        const peers = msg.peers
         this._clearPeers();
-        peers.forEach(peer => this._onPeerJoined(peer));
+        peers.forEach(peer => this._onPeerJoined(peer,currentPeerInfo));
     }
 
     _onPeerLeft(peerId) {
@@ -46,6 +68,20 @@ class PeersUI {
         const $peer = $(peerId);
         if (!$peer) return;
         $peer.ui.setProgress(progress.progress);
+    }
+
+    _closeProgress(message){
+        const peerId = message.sender || message.recipient;
+        const $peer = $(peerId);
+        if (!$peer) return;
+        $peer.ui.closeProgress();
+    }
+    
+    _clearCancel(message) {
+        const peerId = message.sender || message.recipient;
+        const $peer = $(peerId);
+        if (!$peer) return;
+        $peer.ui.clearCancel();
     }
 
     _clearPeers() {
@@ -64,7 +100,8 @@ class PeersUI {
         if (files.length > 0 && peers.length === 1) {
             Events.fire('files-selected', {
                 files: files,
-                to: $$('x-peer').id
+                to: $$('x-peer').id,
+                sender: $('displayName').innerText
             });
         }
     }
@@ -86,6 +123,7 @@ class PeerUI {
                 <div class="name font-subheading"></div>
                 <div class="device-name font-body2"></div>
                 <div class="status font-body2"></div>
+                <button class="cancel-transfer" style="display:none">Cancel</button>
             </label>`
     }
 
@@ -93,6 +131,7 @@ class PeerUI {
         this._peer = peer;
         this._initDom();
         this._bindListeners(this.$el);
+        this._hasCancel = false;
     }
 
     _initDom() {
@@ -116,6 +155,7 @@ class PeerUI {
         el.addEventListener('contextmenu', e => this._onRightClick(e));
         el.addEventListener('touchstart', e => this._onTouchStart(e));
         el.addEventListener('touchend', e => this._onTouchEnd(e));
+        el.querySelector('.cancel-transfer').addEventListener('click',e => this._cancelTransfer(e))
         // prevent browser's default file drop behavior
         Events.on('dragover', e => e.preventDefault());
         Events.on('drop', e => e.preventDefault());
@@ -141,18 +181,23 @@ class PeerUI {
     }
 
     _onFilesSelected(e) {
+        this._hasCancel = false;
         const $input = e.target;
         const files = $input.files;
+        this.$el.querySelector('.cancel-transfer').style.display = "block"
         Events.fire('files-selected', {
             files: files,
-            to: this._peer.id
+            to: this._peer.id,
+            sender: $('displayName').innerText
         });
         $input.value = null; // reset input
     }
 
     setProgress(progress) {
+        if(this._hasCancel) return
         if (progress > 0) {
             this.$el.setAttribute('transfer', '1');
+            this.$el.querySelector('.cancel-transfer').style.display = "block";
         }
         if (progress > 0.5) {
             this.$progress.classList.add('over50');
@@ -164,7 +209,17 @@ class PeerUI {
         if (progress >= 1) {
             this.setProgress(0);
             this.$el.removeAttribute('transfer');
+            this.$el.querySelector('.cancel-transfer').style.display = "none";
         }
+    }
+    clearCancel() {
+        this._hasCancel = false
+    }
+    closeProgress() {
+        this.setProgress(0);
+        this.$el.removeAttribute('transfer');
+        this.$el.querySelector('.cancel-transfer').style.display = "none"
+        this._hasCancel = true
     }
 
     _onDrop(e) {
@@ -172,7 +227,8 @@ class PeerUI {
         const files = e.dataTransfer.files;
         Events.fire('files-selected', {
             files: files,
-            to: this._peer.id
+            to: this._peer.id,
+            sender: $('displayName').innerText
         });
         this._onDragEnd();
     }
@@ -203,6 +259,12 @@ class PeerUI {
             Events.fire('text-recipient', this._peer.id);
         }
     }
+
+    _cancelTransfer(e) {
+        Events.fire('cancel-send', {
+            to: this._peer.id
+        });
+    }
 }
 
 
@@ -230,21 +292,22 @@ class ReceiveDialog extends Dialog {
     constructor() {
         super('receiveDialog');
         Events.on('file-received', e => {
-            this._nextFile(e.detail);
+            this._nextFile(e.detail.file, e.detail.sender);
             window.blop.play();
         });
         this._filesQueue = [];
+        this.$previewBox = this.$el.querySelector('.preview')
     }
 
-    _nextFile(nextFile) {
+    _nextFile(nextFile, sender) {
         if (nextFile) this._filesQueue.push(nextFile);
         if (this._busy) return;
         this._busy = true;
         const file = this._filesQueue.shift();
-        this._displayFile(file);
+        this._displayFile(file, sender);
     }
 
-    _dequeueFile() {
+    _dequeueFile(file,sender) {
         if (!this._filesQueue.length) { // nothing to do
             this._busy = false;
             return;
@@ -252,11 +315,11 @@ class ReceiveDialog extends Dialog {
         // dequeue next file
         setTimeout(_ => {
             this._busy = false;
-            this._nextFile();
+            this._nextFile(undefined,sender);
         }, 300);
     }
 
-    _displayFile(file) {
+    _displayFile(file, sender) {
         const $a = this.$el.querySelector('#download');
         const url = URL.createObjectURL(file.blob);
         $a.href = url;
@@ -266,14 +329,27 @@ class ReceiveDialog extends Dialog {
             $a.click()
             return
         }
-        if(file.mime.split('/')[0] === 'image'){
-            console.log('the file is image');
-            this.$el.querySelector('.preview').style.visibility = 'inherit';
-            this.$el.querySelector("#img-preview").src = url;
+        let mime = file.mime.split('/')[0], 
+            previewElement = {
+                image: 'img',
+                audio: 'audio',
+                video: 'video'
+            }
+        if(Object.keys(previewElement).indexOf(mime) !== -1){
+            console.log('the file is previewable');
+            let element = document.createElement(previewElement[mime]);
+            element.src = url;
+            element.controls = true;
+            element.classList = 'element-preview'
+
+            this.$previewBox.style.visibility = 'inherit';
+            this.$previewBox.appendChild(element)
         }
+
 
         this.$el.querySelector('#fileName').textContent = file.name;
         this.$el.querySelector('#fileSize').textContent = this._formatFileSize(file.size);
+        $('fileSender').innerHTML = sender;
         this.show();
 
         if (window.isDownloadSupported) return;
@@ -297,8 +373,8 @@ class ReceiveDialog extends Dialog {
     }
 
     hide() {
-        this.$el.querySelector('.preview').style.visibility = 'hidden';
-        this.$el.querySelector("#img-preview").src = "";
+        this.$previewBox.style.visibility = 'hidden';
+        this.$previewBox.innerHTML = '';
         super.hide();
         this._dequeueFile();
     }
@@ -309,6 +385,32 @@ class ReceiveDialog extends Dialog {
     }
 }
 
+class EditNameDialog extends Dialog {
+    constructor() {
+        super('editNameDialog');
+        this.$nameText = this.$el.querySelector('#nameTextInput')
+        Events.on('edit-name', e => this._onOpenEditName(e.detail))
+        const button = this.$el.querySelector('form')
+        button.addEventListener('submit', e => {
+            this._sure(e)
+        });
+
+    }
+    _onOpenEditName(){
+        this.$nameText.innerHTML = ""
+        this.show()
+    }
+    _sure(e) {
+        e.preventDefault();
+        if(this.$nameText.innerText == '') {
+            return
+        }
+        localStorage.setItem('displayname',this.$nameText.innerText)
+        Events.fire('edit-name-commit', {
+            text: this.$nameText.innerText
+        });
+    }
+}
 
 class SendTextDialog extends Dialog {
     constructor() {
@@ -317,11 +419,21 @@ class SendTextDialog extends Dialog {
         this.$text = this.$el.querySelector('#textInput');
         const button = this.$el.querySelector('form');
         button.addEventListener('submit', e => this._send(e));
+        this.$text.addEventListener('paste', e => this._onInputPaste(e))
     }
-
+    _onInputPaste(e) {
+        const files = e.clipboardData.files || e.clipboardData.items
+        .filter(i => i.type.indexOf('image') > -1)
+        .map(i => i.getAsFile());
+        if(!files.length) {
+            return
+        }
+        this.hide()
+    }
     _onRecipient(recipient) {
         this._recipient = recipient;
         this._handleShareTargetText();
+        this.$text.innerHTML = ''
         this.show();
 
         const range = document.createRange();
@@ -341,9 +453,11 @@ class SendTextDialog extends Dialog {
 
     _send(e) {
         e.preventDefault();
+        let displayName = $('displayName').innerText
         Events.fire('send-text', {
             to: this._recipient,
-            text: this.$text.innerText
+            text: this.$text.innerText,
+            from: displayName
         });
     }
 }
@@ -358,6 +472,7 @@ class ReceiveTextDialog extends Dialog {
     }
 
     _onText(e) {
+        $('sender').innerHTML = e.sender
         this.$text.innerHTML = '';
         const text = e.text;
         if (isURL(text)) {
@@ -406,7 +521,7 @@ class Notifications {
             this.$button.addEventListener('click', e => this._requestPermission());
         }
         Events.on('text-received', e => this._messageNotification(e.detail.text));
-        Events.on('file-received', e => this._downloadNotification(e.detail.name));
+        Events.on('file-received', e => this._downloadNotification(e.detail.file.name));
     }
 
     _requestPermission() {
@@ -539,6 +654,7 @@ class Snapdrop {
         Events.on('load', e => {
             const receiveDialog = new ReceiveDialog();
             const sendTextDialog = new SendTextDialog();
+            const editNameDialog = new EditNameDialog();
             const receiveTextDialog = new ReceiveTextDialog();
             const toast = new Toast();
             const notifications = new Notifications();
@@ -553,7 +669,7 @@ const snapdrop = new Snapdrop();
 
 
 if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/service-worker.js')
+    navigator.serviceWorker.register('service-worker.js')
         .then(serviceWorker => {
             console.log('Service Worker registered');
             window.serviceWorker = serviceWorker

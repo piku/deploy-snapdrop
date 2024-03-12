@@ -13,7 +13,12 @@ class ServerConnection {
     _connect() {
         clearTimeout(this._reconnectTimer);
         if (this._isConnected() || this._isConnecting()) return;
-        const ws = new WebSocket(this._endpoint());
+       // const ws = new WebSocket(this._endpoint());
+        const lastDisplayName = localStorage.getItem('displayname')
+        const roomid = localStorage.getItem('roomnumber')?localStorage.getItem('roomnumber'):''
+        Events.fire('room-display',roomid)
+        const ws = lastDisplayName ? new WebSocket(this._endpoint()+'?lastDisplayName='+lastDisplayName+'&room='+roomid) : new WebSocket(this._endpoint()+'?room='+roomid)
+       // const ws = lastDisplayName ?new WebSocket('ws://192.168.3.178:3000/server/webrtc?lastDisplayName='+lastDisplayName+'&room='+roomid):new WebSocket('ws://192.168.3.178:3000/server/webrtc?room='+roomid)
         ws.binaryType = 'arraybuffer';
         ws.onopen = e => console.log('WS: server connected');
         ws.onmessage = e => this._onMessage(e.data);
@@ -24,10 +29,10 @@ class ServerConnection {
 
     _onMessage(msg) {
         msg = JSON.parse(msg);
-        console.log('WS:', msg);
         switch (msg.type) {
             case 'peers':
-                Events.fire('peers', msg.peers);
+              //  Events.fire('peers', msg.peers);
+              Events.fire('peers', msg);
                 break;
             case 'peer-joined':
                 Events.fire('peer-joined', msg.peer);
@@ -43,6 +48,9 @@ class ServerConnection {
                 break;
             case 'display-name':
                 Events.fire('display-name', msg);
+                break;
+            case 'peer-modify-name':
+                Events.fire('peer-modify-name', msg.peer);
                 break;
             default:
                 console.error('WS: unkown message type', msg);
@@ -91,43 +99,74 @@ class ServerConnection {
 
 class Peer {
 
-    constructor(serverConnection, peerId) {
+    constructor(serverConnection, peerId, peerDisplayname) {
         this._server = serverConnection;
         this._peerId = peerId;
+        this._peerDisplayname = peerDisplayname
         this._filesQueue = [];
         this._busy = false;
+        this._cancel = false;
     }
 
     sendJSON(message) {
         this._send(JSON.stringify(message));
     }
 
-    sendFiles(files) {
+    sendFiles(files,sender) {
         for (let i = 0; i < files.length; i++) {
             this._filesQueue.push(files[i]);
         }
         if (this._busy) return;
-        this._dequeueFile();
+        this._dequeueFile(sender);
     }
 
-    _dequeueFile() {
-        if (!this._filesQueue.length) return;
-        this._busy = true;
+    _dequeueFile(sender) {
+        if (!this._filesQueue.length && this._cancel) {
+            Events.fire('close-progress',{sender: this._peerId});
+            this._sendCancelFile(this._peerId)
+            return
+        }
+        this._sendClearCancel()
+        Events.fire('clear-cancel', {sender: this._peerId});
+        this._cancel = false
         const file = this._filesQueue.shift();
-        this._sendFile(file);
+        this._sendFile(file,sender);
     }
 
-    _sendFile(file) {
+    _sendCancelFile(sender) {
+        this.sendJSON({
+            type: 'cancel-send',
+            sender: sender
+        });
+    }
+
+    _sendClearCancel() {
+        this.sendJSON({
+            type: 'm-clear-cancel'       
+        });
+    }
+
+    _sendFile(file, sender) {
+        if(!file) return
         this.sendJSON({
             type: 'header',
             name: file.name,
             mime: file.type,
-            size: file.size
+            size: file.size,
+            sender: sender
         });
         this._chunker = new FileChunker(file,
-            chunk => this._send(chunk),
+            chunk => {
+                this._send(chunk)
+            },
             offset => this._onPartitionEnd(offset));
         this._chunker.nextPartition();
+    }
+
+    cancelSend() {
+        this._cancel = true
+        this._busy = false;
+        this._dequeueFile();
     }
 
     _onPartitionEnd(offset) {
@@ -139,7 +178,7 @@ class Peer {
     }
 
     _sendNextPartition() {
-        if (!this._chunker || this._chunker.isFileEnd()) return;
+        if (!this._chunker || this._chunker.isFileEnd() || this._cancel) return;
         this._chunker.nextPartition();
     }
 
@@ -152,11 +191,15 @@ class Peer {
             this._onChunkReceived(message);
             return;
         }
+        let sender = '';
         message = JSON.parse(message);
         console.log('RTC:', message);
+        if(message.sender){
+            sender = message.sender
+        }
         switch (message.type) {
             case 'header':
-                this._onFileHeader(message);
+                this._onFileHeader(message, sender);
                 break;
             case 'partition':
                 this._onReceivedPartitionEnd(message);
@@ -168,10 +211,16 @@ class Peer {
                 this._onDownloadProgress(message.progress);
                 break;
             case 'transfer-complete':
-                this._onTransferCompleted();
+                this._onTransferCompleted(sender);
+                break;
+            case 'cancel-send':
+                Events.fire('close-progress', {recipient: this._peerId});
+                break;
+            case 'm-clear-cancel':
+                Events.fire('clear-cancel', {recipient: this._peerId});
                 break;
             case 'text':
-                this._onTextReceived(message);
+                this._onTextReceived(message,sender);
                 break;
         }
     }
@@ -182,7 +231,7 @@ class Peer {
             name: header.name,
             mime: header.mime,
             size: header.size
-        }, file => this._onFileReceived(file));
+        }, file => this._onFileReceived(file, header.sender));
     }
 
     _onChunkReceived(chunk) {
@@ -202,34 +251,37 @@ class Peer {
         Events.fire('file-progress', { sender: this._peerId, progress: progress });
     }
 
-    _onFileReceived(proxyFile) {
-        Events.fire('file-received', proxyFile);
-        this.sendJSON({ type: 'transfer-complete' });
+    _onFileReceived(proxyFile, sender) {
+        Events.fire('file-received', {file:proxyFile, sender:sender});
+        Events.fire('clear-cancel', {recipient: this._peerId});
+        this.sendJSON({ type: 'transfer-complete', sender: sender});
     }
 
-    _onTransferCompleted() {
+    _onTransferCompleted(sender) {
         this._onDownloadProgress(1);
         this._reader = null;
         this._busy = false;
-        this._dequeueFile();
+        this._dequeueFile(sender);
         Events.fire('notify-user', 'File transfer completed.');
     }
 
-    sendText(text) {
+    sendText(text,sender) {
         const unescaped = btoa(unescape(encodeURIComponent(text)));
-        this.sendJSON({ type: 'text', text: unescaped });
+        const unescapedSender = btoa(unescape(encodeURIComponent(sender)));
+        this.sendJSON({ type: 'text', text: unescaped, sender: unescapedSender});
     }
 
-    _onTextReceived(message) {
+    _onTextReceived(message,sender) {
         const escaped = decodeURIComponent(escape(atob(message.text)));
-        Events.fire('text-received', { text: escaped, sender: this._peerId });
+        const escapedSender = decodeURIComponent(escape(atob(sender)));
+        Events.fire('text-received', { text: escaped, sender: escapedSender });
     }
 }
 
 class RTCPeer extends Peer {
 
-    constructor(serverConnection, peerId) {
-        super(serverConnection, peerId);
+    constructor(serverConnection, peerId, peerDisplayname) {
+        super(serverConnection, peerId, peerDisplayname);
         if (!peerId) return; // we will listen for a caller
         this._connect(peerId, true);
     }
@@ -369,6 +421,8 @@ class PeersManager {
         Events.on('files-selected', e => this._onFilesSelected(e.detail));
         Events.on('send-text', e => this._onSendText(e.detail));
         Events.on('peer-left', e => this._onPeerLeft(e.detail));
+        Events.on('peer-name',e => this._onModifyName(e.detail))
+        Events.on('cancel-send',e => this._onCancelSend(e.detail))
     }
 
     _onMessage(message) {
@@ -378,14 +432,18 @@ class PeersManager {
         this.peers[message.sender].onServerMessage(message);
     }
 
-    _onPeers(peers) {
+    _onPeers(msg) {
+        const peers = msg.peers;
         peers.forEach(peer => {
             if (this.peers[peer.id]) {
-                this.peers[peer.id].refresh();
-                return;
+                // this.peers[peer.id].refresh();
+                // return;
+
+                // Delete conn, will re-create the conn later...
+                this._onPeerLeft(peer.id)
             }
             if (window.isRtcSupported && peer.rtcSupported) {
-                this.peers[peer.id] = new RTCPeer(this._server, peer.id);
+                this.peers[peer.id] = new RTCPeer(this._server, peer.id, peer.name.displayName);
             } else {
                 this.peers[peer.id] = new WSPeer(this._server, peer.id);
             }
@@ -397,11 +455,15 @@ class PeersManager {
     }
 
     _onFilesSelected(message) {
-        this.peers[message.to].sendFiles(message.files);
+        this.peers[message.to].sendFiles(message.files,message.sender);
     }
 
     _onSendText(message) {
-        this.peers[message.to].sendText(message.text);
+        this.peers[message.to].sendText(message.text,message.from);
+    }
+
+    _onCancelSend(message) {
+        this.peers[message.to].cancelSend()
     }
 
     _onPeerLeft(peerId) {
@@ -411,9 +473,20 @@ class PeersManager {
         peer._peer.close();
     }
 
+    //修改peer的名字
+    _onModifyName(name) {
+        const message = {displayName: name}
+        this._server.send(message)
+    }
+
+    //取消发送
+    _onCancelSend(message) {
+        this.peers[message.to].cancelSend()
+    }
+
 }
 
-class WSPeer {
+class WSPeer extends Peer {
     _send(message) {
         message.to = this._peerId;
         this._server.send(message);
@@ -522,7 +595,24 @@ class Events {
 
 RTCPeer.config = {
     'sdpSemantics': 'unified-plan',
-    'iceServers': [{
-        urls: 'stun:stun.l.google.com:19302'
-    }]
+    'iceServers': [
+        {
+            urls: 'stun:stun.l.google.com:19302',
+        },
+        {
+            urls: "turn:openrelay.metered.ca:80",
+            username: "openrelayproject",
+            credential: "openrelayproject",
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443",
+            username: "openrelayproject",
+            credential: "openrelayproject",
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443?transport=tcp",
+            username: "openrelayproject",
+            credential: "openrelayproject",
+        },
+    ],
 }
